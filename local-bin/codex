@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if [ -n "${CODEX_EFFORT:-}" ]; then
+  set -- -c "model_reasoning_effort=\"$CODEX_EFFORT\"" "$@"
+fi
+
+exec /usr/local/bin/codex \
+  -C "$PWD" \
+  -c "projects = { \"$PWD\" = { trust_level = \"trusted\" } }" \
+  "$@"

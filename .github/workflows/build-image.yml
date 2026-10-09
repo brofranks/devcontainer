@@ -1,0 +1,169 @@
+name: Build devcontainer image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 1 * * *'
+
+concurrency:
+  group: devcontainer-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Validate scripts
+        run: shellcheck ./*.sh local-bin/*
+
+  resolve:
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      downloads-key: ${{ steps.versions.outputs.downloads-key }}
+      build-args: ${{ steps.versions.outputs.build-args }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Resolve exact versions
+        id: versions
+        run: |
+          ./resolve-versions.sh
+          key=$(jq -c '[.tools[].artifacts]' versions.json | sha256sum | cut -d ' ' -f 1)
+          {
+            echo "downloads-key=$key"
+            echo 'build-args<<EOF'
+            cat .env
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - name: Upload shared build inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: resolved-versions
+          path: |
+            versions.json
+            package.json
+            requirements.txt
+            .env
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+  build:
+    needs: resolve
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Download shared build inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: resolved-versions
+      # Cache downloads by architecture and resolved artifacts.
+      - name: Cache downloaded artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .cache
+          key: deps-${{ matrix.arch }}-${{ needs.resolve.outputs.downloads-key }}
+          restore-keys: deps-${{ matrix.arch }}-
+      # Fetch changed pins and verify published checksums, including for restored archives.
+      - name: Download dependencies
+        run: ./download-deps.sh
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          provenance: false
+          sbom: false
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:stable
+          cache-to: type=inline
+          build-args: ${{ needs.resolve.outputs.build-args }}
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish stable manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          digests=(*)
+          docker buildx imagetools create -t "$IMAGE:stable" "${digests[@]/#/$IMAGE@sha256:}"
+          digest=$(docker buildx imagetools inspect "$IMAGE:stable" --format '{{json .Manifest.Digest}}' | jq -er .)
+          {
+            echo "Published: \`$IMAGE:stable@$digest\`"
+            echo "Source commit: \`$GITHUB_SHA\`"
+            echo 'Exact tool versions: resolved-versions artifact and /usr/local/share/devcontainer/versions.json inside the image.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Prune obsolete GHCR versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_OWNER: ${{ github.repository_owner }}
+          GHCR_PACKAGE: ${{ github.event.repository.name }}
+        run: ./prune-ghcr.sh
